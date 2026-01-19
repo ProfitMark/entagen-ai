@@ -1,467 +1,297 @@
+
 import os
-import json
-import io
-from datetime import datetime
+import asyncio
+import uuid
+import datetime
+import mimetypes
+from base64 import b64encode
 from typing import List, Optional
 
-from fastapi import FastAPI, File, UploadFile, Request, HTTPException, status
+from fastapi import FastAPI, Request, HTTPException, status, UploadFile, File, Header, Depends
 from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles # Although we use CDN, good practice
-from google.cloud import firestore
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, EmailStr
+
 import google.generativeai as genai
-from pypdf import PdfReader # For PDF text extraction
-from docx import Document as DocxDocument # For DOCX text extraction
+from google.cloud import firestore
 
 # --- Environment Configuration ---
-# Ensure GEMINI_API_KEY is set in your Cloud Run environment variables
-# For local development, you can use python-dotenv:
-# from dotenv import load_dotenv
-# load_dotenv()
-
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 if not GEMINI_API_KEY:
-    raise ValueError("GEMINI_API_KEY environment variable not set.")
+    raise ValueError("GEMINI_API_KEY environment variable not set. Please set it for Gemini AI operations.")
 
+# --- Firestore Initialization ---
+try:
+    db = firestore.Client()
+    documents_collection_ref = db.collection("documents")
+    users_collection_ref = db.collection("users") # New: Users collection
+    print("Firestore client initialized successfully.")
+except Exception as e:
+    print(f"Error initializing Firestore client: {e}")
+    # For local dev, ensure GOOGLE_APPLICATION_CREDENTIALS is set if not using gcloud auth.
+
+# --- Gemini AI Configuration ---
 genai.configure(api_key=GEMINI_API_KEY)
-GEMINI_MODEL_FLASH = 'gemini-1.5-flash' # Prioritizing Flash for cost/speed
-LLM_MODEL = genai.GenerativeModel(GEMINI_MODEL_FLASH)
+GEMINI_MODEL_NAME = 'gemini-2.5-flash-preview'
 
-# Initialize Firestore DB client
-# In Cloud Run, this will automatically pick up credentials from the service account
-db = firestore.Client()
-DOCUMENTS_COLLECTION = 'documents'
+# --- Pydantic Models ---
+class DocumentStatus(str, BaseModel):
+    PENDING = 'PENDING'
+    COMPLETED = 'COMPLETED'
+    FAILED = 'FAILED'
 
+class Document(BaseModel):
+    id: str
+    name: str
+    summary: Optional[str] = None
+    status: DocumentStatus
+    timestamp: datetime.datetime
+    user_id: str # New: Link document to a user
+
+class AnalyzeDocumentResponse(BaseModel):
+    summary: Optional[str] = None
+    status: DocumentStatus
+    documentId: str
+
+# New Pydantic models for user registration
+class UserRegistrationRequest(BaseModel):
+    email: EmailStr
+
+class UserResponse(BaseModel):
+    id: str # For simplicity, the ID is the email itself
+    email: EmailStr
+
+# --- FastAPI Dependencies ---
+async def get_current_user_id(x_user_id: Optional[str] = Header(None)) -> str:
+    """Dependency to extract user ID from X-User-Id header."""
+    if not x_user_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Изисква се X-User-Id хедър за автентикация."
+        )
+    return x_user_id
+
+# --- Document Processing Service ---
+class DocumentService:
+    def __init__(self, gemini_model_name: str, documents_collection: firestore.CollectionReference, users_collection: firestore.CollectionReference):
+        self._gemini_model_name = gemini_model_name
+        self._documents_collection = documents_collection
+        self._users_collection = users_collection # New: Users collection reference
+        self._gemini_model = genai.GenerativeModel(self._gemini_model_name)
+
+    async def register_or_get_user(self, email: EmailStr) -> UserResponse:
+        """Registers a new user or returns an existing one by email."""
+        user_ref = self._users_collection.document(email) # Using email as document ID
+        user_doc = user_ref.get()
+
+        if user_doc.exists:
+            print(f"Потребител {email} вече съществува.")
+            return UserResponse(id=email, email=email)
+        else:
+            user_data = {
+                "email": email,
+                "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            }
+            user_ref.set(user_data)
+            print(f"Нов потребител регистриран: {email}")
+            return UserResponse(id=email, email=email)
+
+    async def save_document_to_firestore(self, document_id: str, name: str, summary: Optional[str], status: DocumentStatus, user_id: str):
+        """Saves or updates a document entry in Firestore, linked to a user."""
+        doc_data = {
+            "name": name,
+            "summary": summary,
+            "status": status.value,
+            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "user_id": user_id, # New: Store user ID with the document
+        }
+        self._documents_collection.document(document_id).set(doc_data)
+        print(f"Документ '{name}' ({document_id}) записан за потребител '{user_id}' във Firestore със статус: {status.value}")
+
+    async def get_document_from_firestore(self, document_id: str, user_id: str) -> Optional[Document]:
+        """Fetches a single document from Firestore by ID, ensuring it belongs to the user."""
+        doc_ref = self._documents_collection.document(document_id)
+        doc = doc_ref.get()
+        if doc.exists:
+            doc_data = doc.to_dict()
+            if doc_data.get("user_id") != user_id:
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Нямате разрешение да достъпвате този документ.")
+            timestamp_dt = datetime.datetime.fromisoformat(doc_data.get("timestamp"))
+            return Document(
+                id=doc.id,
+                name=doc_data.get("name"),
+                summary=doc_data.get("summary"),
+                status=DocumentStatus(doc_data.get("status", DocumentStatus.PENDING.value)),
+                timestamp=timestamp_dt,
+                user_id=doc_data.get("user_id") # Include user_id in the response
+            )
+        return None
+
+    async def get_document_history_from_firestore(self, user_id: str) -> List[Document]:
+        """Fetches all analyzed documents for a specific user from Firestore, ordered by timestamp."""
+        docs_stream = self._documents_collection.where("user_id", "==", user_id).order_by("timestamp", direction=firestore.Query.DESCENDING).stream()
+        history = []
+        for doc in docs_stream:
+            doc_data = doc.to_dict()
+            timestamp_dt = datetime.datetime.fromisoformat(doc_data.get("timestamp"))
+            history.append(Document(
+                id=doc.id,
+                name=doc_data.get("name"),
+                summary=doc_data.get("summary"),
+                status=DocumentStatus(doc_data.get("status", DocumentStatus.PENDING.value)),
+                timestamp=timestamp_dt,
+                user_id=doc_data.get("user_id")
+            ))
+        return history
+
+    async def _process_file_with_gemini(self, file_content_bytes: bytes, mime_type: str) -> str:
+        """Sends file content to Gemini for analysis and returns the summary."""
+        prompt_text = "Обобщи този документ на български език, като извлечеш основните точки, цели и ключови заключения. Бъди подробен, но и кратък."
+
+        try:
+            file_part = genai.upload_file(file_content_bytes, mime_type=mime_type)
+            contents = [prompt_text, file_part]
+
+            response = await self._gemini_model.generate_content(
+                contents,
+                config={
+                    "temperature": 0.3,
+                    "topK": 32,
+                    "topP": 0.8,
+                },
+                request_options={"timeout": 600}
+            )
+
+            summary = response.text
+            if not summary:
+                raise ValueError("Gemini AI не върна обобщение.")
+            
+            genai.delete_file(file_part.name)
+            
+            return summary
+        except genai.types.BrokenGenerationError as e:
+            print(f"Gemini AI генерацията се счупи: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Gemini AI не успя да генерира съдържание. Вероятно съдържанието е неподходящо или твърде голямо. Грешка: {str(e)}"
+            )
+        except Exception as e:
+            print(f"Грешка при извикване на Gemini AI: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Грешка при обработка на документа с AI: {str(e)}"
+            )
+
+    async def analyze_document(self, file: UploadFile, user_id: str) -> AnalyzeDocumentResponse:
+        """Handles the full document analysis workflow, linking to a user."""
+        document_id = str(uuid.uuid4())
+        file_name = file.filename or "Неизвестен документ"
+        
+        mime_type = file.content_type if file.content_type and file.content_type != "application/octet-stream" \
+            else mimetypes.guess_type(file_name)[0] or "application/octet-stream"
+
+        if not mime_type or mime_type == "application/octet-stream":
+             print(f"Предупреждение: Неизвестен MIME тип за файла '{file_name}'. Опит за обработка като текст/обикновен текст.")
+             mime_type = "text/plain"
+
+        # 1. Initial save to Firestore as PENDING
+        await self.save_document_to_firestore(document_id, file_name, None, DocumentStatus.PENDING, user_id)
+
+        try:
+            file_content = await file.read()
+            # 2. Process with Gemini AI
+            summary = await self._process_file_with_gemini(file_content, mime_type)
+
+            # 3. Update Firestore with COMPLETED status and summary
+            await self.save_document_to_firestore(document_id, file_name, summary, DocumentStatus.COMPLETED, user_id)
+
+            return AnalyzeDocumentResponse(documentId=document_id, summary=summary, status=DocumentStatus.COMPLETED)
+        except HTTPException:
+            await self.save_document_to_firestore(document_id, file_name, None, DocumentStatus.FAILED, user_id)
+            raise
+        except Exception as e:
+            await self.save_document_to_firestore(document_id, file_name, None, DocumentStatus.FAILED, user_id)
+            print(f"Неочаквана грешка по време на анализ на документа '{file_name}' ({document_id}) за потребител '{user_id}': {e}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Неочаквана грешка при анализ на документа: {str(e)}"
+            )
+
+# --- FastAPI App Initialization ---
 app = FastAPI(
-    title="EntaGen: Анализ на Документи",
-    description="Висококачествен инструмент за анализ на корпоративни документи с Gemini 1.5 Flash и FastAPI.",
-    version="1.0.0"
+    title="EntaGen API",
+    description="Backend за EntaGen - инструмент за анализ на корпоративни документи с Gemini AI.",
+    version="1.0.0",
 )
 
-# --- Utility Functions for Text Extraction ---
+# --- CORS Middleware ---
+# For development, allow all origins. In a real production setup, origins should be restricted to known frontend URLs.
+origins = ["*"] 
 
-async def extract_text_from_pdf(file: UploadFile) -> str:
-    """Извлича текст от PDF файл."""
-    try:
-        reader = PdfReader(io.BytesIO(await file.read()))
-        text = ""
-        for page in reader.pages:
-            text += page.extract_text() or ""
-        return text
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"Неуспешно извличане на текст от PDF: {e}"
-        )
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"], # Allow X-User-Id header
+)
 
-async def extract_text_from_docx(file: UploadFile) -> str:
-    """Извлича текст от DOCX файл."""
-    try:
-        document = DocxDocument(io.BytesIO(await file.read()))
-        text = "\n".join([paragraph.text for paragraph in document.paragraphs])
-        return text
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"Неуспешно извличане на текст от DOCX: {e}"
-        )
+# --- Global Exception Handlers ---
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    """Handles custom HTTP exceptions, returning a JSON response."""
+    print(f"HTTP Грешка: {exc.status_code} - {exc.detail} (URL: {request.url})")
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail},
+    )
 
-async def analyze_document_with_gemini(text_content: str) -> str:
-    """Използва Gemini 1.5 Flash за генериране на резюме."""
-    try:
-        prompt = (
-            "Вие сте експерт по корпоративен анализ на документи. "
-            "Моля, резюмирайте следния документ на български език. "
-            "Обобщението трябва да е кратко, стегнато и да улавя основните точки. "
-            "Използвайте максимум 200 думи и форматирайте като списък с точки, ако е приложимо:\n\n"
-            f"{text_content}"
-        )
-        response = await LLM_MODEL.generate_content_async(prompt)
-        return response.text
-    except Exception as e:
-        # Log the error for debugging
-        print(f"Грешка при анализ с Gemini: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Възникна грешка при анализа на документа. Моля, опитайте отново."
-        )
+@app.exception_handler(Exception)
+async def generic_exception_handler(request: Request, exc: Exception):
+    """Handles generic Python exceptions, returning a 500 JSON response."""
+    import traceback
+    traceback.print_exc()
+    print(f"Неочаквана сървърна грешка: {exc} (URL: {request.url})")
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={"detail": "Възникна непредвидена грешка на сървъра. Моля, опитайте отново по-късно."},
+    )
 
-# --- FastAPI Endpoints ---
+# Initialize DocumentService with both collections
+document_service = DocumentService(GEMINI_MODEL_NAME, documents_collection_ref, users_collection_ref)
 
-@app.get("/", response_class=HTMLResponse)
-async def read_root():
-    """
-    Основна страница на приложението EntaGen.
-    Предоставя HTML интерфейс за качване и преглед на документи.
-    """
-    return HTMLResponse(content=get_html_content(), status_code=status.HTTP_200_OK)
+# --- Frontend Serving ---
+templates = Jinja2Templates(directory="templates")
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
-@app.post("/upload")
-async def upload_document(file: UploadFile = File(...)):
-    """
-    Качва документ за анализ.
-    Поддържа PDF и DOCX файлове.
-    """
-    if not file.filename:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Не е избран файл."
-        )
+@app.get("/", response_class=HTMLResponse, include_in_schema=False)
+async def serve_frontend(request: Request):
+    return templates.TemplateResponse("index.html", {"request": request})
 
-    file_extension = file.filename.split('.')[-1].lower()
-    text_content = ""
+# --- API Routes ---
 
-    if file_extension == "pdf":
-        text_content = await extract_text_from_pdf(file)
-    elif file_extension == "docx":
-        text_content = await extract_text_from_docx(file)
-    else:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Поддържат се само PDF и DOCX файлове."
-        )
+# User management endpoint
+@app.post("/users/register", response_model=UserResponse, summary="Регистрация / Вход на потребител",
+          description="Регистрира нов потребител или връща съществуващ по имейл адрес. Имейлът служи като потребителски ID.")
+async def register_user_endpoint(request: UserRegistrationRequest):
+    return await document_service.register_or_get_user(request.email)
 
-    if not text_content.strip():
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Файлът е празен или не може да бъде извлечен текст."
-        )
+@app.post("/documents/analyze", response_model=AnalyzeDocumentResponse, summary="Анализиране на нов документ",
+          description="Качва и анализира нов документ, използвайки Gemini AI, асоциирайки го с текущия потребител.")
+async def analyze_document_endpoint(file: UploadFile = File(...), current_user_id: str = Depends(get_current_user_id)):
+    return await document_service.analyze_document(file, current_user_id)
 
-    summary = await analyze_document_with_gemini(text_content)
+@app.get("/documents/history", response_model=List[Document], summary="История на документи",
+         description="Връща списък с всички анализирани документи за текущия потребител, подредени по дата на създаване.")
+async def get_document_history_endpoint(current_user_id: str = Depends(get_current_user_id)):
+    return await document_service.get_document_history_from_firestore(current_user_id)
 
-    try:
-        doc_ref = db.collection(DOCUMENTS_COLLECTION).document()
-        doc_data = {
-            "name": file.filename,
-            "summary": summary,
-            "status": "Анализиран",
-            "timestamp": firestore.SERVER_TIMESTAMP # Use server timestamp for consistency
-        }
-        await doc_ref.set(doc_data) # Await the async set operation
-
-        return JSONResponse(
-            status_code=status.HTTP_200_OK,
-            content={"message": "Документът е успешно качен и анализиран.", "document_id": doc_ref.id}
-        )
-    except Exception as e:
-        print(f"Грешка при запис във Firestore: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Грешка при запазване на документа в базата данни."
-        )
-
-@app.get("/documents", response_class=JSONResponse)
-async def get_documents():
-    """
-    Връща списък с всички анализирани документи от Firestore.
-    """
-    try:
-        documents = []
-        docs = db.collection(DOCUMENTS_COLLECTION).order_by("timestamp", direction=firestore.Query.DESCENDING).stream()
-        for doc in docs:
-            doc_data = doc.to_dict()
-            # Convert timestamp to a readable string if it exists
-            if 'timestamp' in doc_data and doc_data['timestamp']:
-                # firestore.SERVER_TIMESTAMP returns a Timestamp object
-                doc_data['timestamp'] = doc_data['timestamp'].isoformat() if hasattr(doc_data['timestamp'], 'isoformat') else str(doc_data['timestamp'])
-            
-            documents.append({"id": doc.id, **doc_data})
-        return JSONResponse(content=documents, status_code=status.HTTP_200_OK)
-    except Exception as e:
-        print(f"Грешка при извличане на документи от Firestore: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Грешка при извличане на документи."
-        )
-
-@app.delete("/documents/{doc_id}")
-async def delete_document(doc_id: str):
-    """
-    Изтрива документ от Firestore по неговия ID.
-    """
-    try:
-        doc_ref = db.collection(DOCUMENTS_COLLECTION).document(doc_id)
-        if not (await doc_ref.get()).exists: # Check if document exists
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Документът не е намерен."
-            )
-        await doc_ref.delete() # Await the async delete operation
-        return JSONResponse(
-            status_code=status.HTTP_200_OK,
-            content={"message": "Документът е успешно изтрит."}
-        )
-    except HTTPException as e:
-        raise e
-    except Exception as e:
-        print(f"Грешка при изтриване на документ във Firestore: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Грешка при изтриване на документа."
-        )
-
-# --- HTML Frontend Content ---
-
-def get_html_content():
-    """
-    Генерира HTML съдържанието за потребителския интерфейс.
-    Използва Tailwind CSS (CDN) за модерен Dark Mode дизайн.
-    """
-    return f"""
-<!DOCTYPE html>
-<html lang="bg" class="dark">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>EntaGen: Анализ на Документи</title>
-    <!-- Tailwind CSS CDN -->
-    <script src="https://cdn.tailwindcss.com"></script>
-    <style>
-        /* Dark Mode configuration for Tailwind CSS */
-        :root {{
-            --color-primary: #1a73e8; /* Google Blue */
-            --color-danger: #ea4335; /* Google Red */
-        }}
-        .dark {{
-            color-scheme: dark;
-        }}
-        .dark body {{
-            background-color: #1a202c; /* Dark Gray */
-            color: #e2e8f0; /* Light Gray */
-        }}
-        .dark .bg-white {{
-            background-color: #2d3748; /* Darker Gray */
-        }}
-        .dark .text-gray-700 {{
-            color: #cbd5e0; /* Lighter Gray */
-        }}
-        .dark .border-gray-300 {{
-            border-color: #4a5568; /* Gray Border */
-        }}
-        .dark .hover\\:bg-gray-50 {{
-            background-color: #4a5568; /* Darker Gray on hover */
-        }}
-        /* Custom drag-and-drop styles */
-        .drag-area {{
-            border: 2px dashed #4a5568;
-            background-color: #2d3748;
-            transition: background-color 0.3s ease;
-        }}
-        .drag-area.highlight {{
-            background-color: #4a5568;
-            border-color: var(--color-primary);
-        }}
-        .upload-button {{
-            background-color: var(--color-primary);
-        }}
-        .upload-button:hover {{
-            background-color: #1558b3;
-        }}
-        .delete-button {{
-            background-color: var(--color-danger);
-        }}
-        .delete-button:hover {{
-            background-color: #d12a1c;
-        }}
-        .spinner {{
-            border: 4px solid rgba(255, 255, 255, 0.3);
-            border-top: 4px solid var(--color-primary);
-            border-radius: 50%;
-            width: 30px;
-            height: 30px;
-            animation: spin 1s linear infinite;
-        }}
-        @keyframes spin {{
-            0% {{ transform: rotate(0deg); }}
-            100% {{ transform: rotate(360deg); }}
-        }}
-    </style>
-</head>
-<body class="bg-gray-900 text-gray-100 font-sans leading-normal tracking-normal p-4">
-
-    <div class="container mx-auto p-4 bg-gray-800 shadow-xl rounded-lg mt-8 max-w-4xl">
-        <h1 class="text-4xl font-bold text-center mb-8 text-white">EntaGen: Анализ на Документи</h1>
-
-        <!-- File Upload Section -->
-        <div class="mb-8 p-6 bg-gray-700 rounded-lg shadow-md">
-            <h2 class="text-2xl font-semibold mb-4 text-white">Качване на Документ</h2>
-            <div id="drag-area" class="drag-area flex flex-col items-center justify-center p-10 text-center rounded-lg cursor-pointer transition-all duration-300 ease-in-out hover:border-blue-500 hover:bg-gray-600">
-                <input type="file" id="fileInput" accept=".pdf,.docx" multiple class="hidden">
-                <svg class="w-16 h-16 text-gray-400 mb-3" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 0115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"></path></svg>
-                <p class="text-lg text-gray-300">Плъзнете и пуснете файлове тук или <span class="text-blue-400 font-medium hover:underline">кликнете за избор</span></p>
-                <p class="text-sm text-gray-400 mt-1">(Поддържат се .pdf и .docx файлове)</p>
-                <div id="fileListPreview" class="mt-4 w-full text-left text-gray-300"></div>
-            </div>
-            <div id="uploadStatus" class="mt-4 text-center font-medium"></div>
-            <div id="loadingSpinner" class="hidden mt-4 flex justify-center">
-                <div class="spinner"></div>
-            </div>
-        </div>
-
-        <!-- Document List Section -->
-        <div class="p-6 bg-gray-700 rounded-lg shadow-md">
-            <h2 class="text-2xl font-semibold mb-4 text-white">Анализирани Документи</h2>
-            <div id="documentsList" class="space-y-4">
-                <p id="noDocumentsMessage" class="text-gray-400 text-center">Няма анализирани документи.</p>
-                <!-- Documents will be loaded here by JavaScript -->
-            </div>
-        </div>
-    </div>
-
-    <script>
-        const dragArea = document.getElementById('drag-area');
-        const fileInput = document.getElementById('fileInput');
-        const fileListPreview = document.getElementById('fileListPreview');
-        const uploadStatus = document.getElementById('uploadStatus');
-        const loadingSpinner = document.getElementById('loadingSpinner');
-        const documentsList = document.getElementById('documentsList');
-        const noDocumentsMessage = document.getElementById('noDocumentsMessage');
-
-        // --- Drag and Drop Handlers ---
-        dragArea.addEventListener('click', () => fileInput.click());
-        fileInput.addEventListener('change', (e) => handleFiles(e.target.files));
-
-        dragArea.addEventListener('dragover', (e) => {
-            e.preventDefault();
-            dragArea.classList.add('highlight');
-        });
-        dragArea.addEventListener('dragleave', () => {
-            dragArea.classList.remove('highlight');
-        });
-        dragArea.addEventListener('drop', (e) => {
-            e.preventDefault();
-            dragArea.classList.remove('highlight');
-            handleFiles(e.dataTransfer.files);
-        });
-
-        // --- File Handling and Upload ---
-        async function handleFiles(files) {
-            fileListPreview.innerHTML = ''; // Clear previous previews
-            uploadStatus.textContent = '';
-            loadingSpinner.classList.remove('hidden');
-
-            if (files.length === 0) {
-                loadingSpinner.classList.add('hidden');
-                return;
-            }
-
-            for (const file of files) {
-                const li = document.createElement('div');
-                li.className = 'flex items-center justify-between p-2 bg-gray-600 rounded-md mb-2';
-                li.innerHTML = `
-                    <span class="text-gray-200">${file.name}</span>
-                    <span class="text-gray-400 text-sm">Качване...</span>
-                `;
-                fileListPreview.appendChild(li);
-
-                if (!['application/pdf', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'].includes(file.type)) {
-                    li.children[1].textContent = 'Неподдържан формат';
-                    li.children[1].className = 'text-red-400 text-sm';
-                    continue; // Skip unsupported files
-                }
-
-                const formData = new FormData();
-                formData.append('file', file);
-
-                try {
-                    const response = await fetch('/upload', {
-                        method: 'POST',
-                        body: formData,
-                    });
-                    const data = await response.json();
-
-                    if (response.ok) {
-                        li.children[1].textContent = 'Успешно анализиран!';
-                        li.children[1].className = 'text-green-400 text-sm';
-                        fetchDocuments(); // Refresh the list after successful upload
-                    } else {
-                        li.children[1].textContent = `Грешка: ${data.detail || 'Неизвестна грешка'}`;
-                        li.children[1].className = 'text-red-400 text-sm';
-                    }
-                } catch (error) {
-                    console.error('Upload error:', error);
-                    li.children[1].textContent = 'Грешка в мрежата или сървъра.';
-                    li.children[1].className = 'text-red-400 text-sm';
-                }
-            }
-            loadingSpinner.classList.add('hidden');
-        }
-
-        // --- Document List Management ---
-        async function fetchDocuments() {
-            loadingSpinner.classList.remove('hidden');
-            documentsList.innerHTML = ''; // Clear current list
-            try {
-                const response = await fetch('/documents');
-                const documents = await response.json();
-
-                if (documents.length === 0) {
-                    noDocumentsMessage.classList.remove('hidden');
-                } else {
-                    noDocumentsMessage.classList.add('hidden');
-                    documents.forEach(doc => {
-                        const docElement = document.createElement('div');
-                        docElement.id = `doc-${doc.id}`;
-                        docElement.className = 'bg-gray-800 p-4 rounded-lg shadow-md border border-gray-600 flex flex-col md:flex-row md:items-start justify-between gap-4';
-                        
-                        const timestamp = doc.timestamp ? new Date(doc.timestamp).toLocaleString('bg-BG') : 'Неизвестна дата';
-
-                        docElement.innerHTML = `
-                            <div class="flex-grow">
-                                <h3 class="text-xl font-semibold text-white mb-2">${doc.name}</h3>
-                                <p class="text-gray-300 text-sm mb-1">Статус: <span class="text-green-400">${doc.status}</span></p>
-                                <p class="text-gray-400 text-xs mb-3">Качено на: ${timestamp}</p>
-                                <div class="bg-gray-700 p-3 rounded-md text-gray-200 text-sm leading-relaxed max-h-48 overflow-y-auto">
-                                    <h4 class="font-medium text-white mb-1">Резюме:</h4>
-                                    <p>${doc.summary || 'Няма налично резюме.'}</p>
-                                </div>
-                            </div>
-                            <div class="flex-shrink-0 mt-4 md:mt-0">
-                                <button onclick="deleteDocument('${doc.id}')" class="delete-button text-white px-4 py-2 rounded-md transition-colors duration-200 text-sm">
-                                    Изтрий
-                                </button>
-                            </div>
-                        `;
-                        documentsList.appendChild(docElement);
-                    });
-                }
-            } catch (error) {
-                console.error('Error fetching documents:', error);
-                documentsList.innerHTML = `<p class="text-red-400 text-center">Грешка при зареждане на документи.</p>`;
-                noDocumentsMessage.classList.add('hidden'); // Hide if there's an error message
-            } finally {
-                loadingSpinner.classList.add('hidden');
-            }
-        }
-
-        async function deleteDocument(docId) {
-            if (!confirm('Сигурни ли сте, че искате да изтриете този документ?')) {
-                return;
-            }
-
-            loadingSpinner.classList.remove('hidden');
-            try {
-                const response = await fetch(`/documents/${docId}`, {
-                    method: 'DELETE',
-                });
-                const data = await response.json();
-
-                if (response.ok) {
-                    alert(data.message);
-                    fetchDocuments(); // Refresh the list
-                } else {
-                    alert(`Грешка при изтриване: ${data.detail || 'Неизвестна грешка'}`);
-                }
-            } catch (error) {
-                console.error('Delete error:', error);
-                alert('Грешка в мрежата или сървъра при изтриване.');
-            } finally {
-                loadingSpinner.classList.add('hidden');
-            }
-        }
-
-        // --- Initial Load ---
-        document.addEventListener('DOMContentLoaded', fetchDocuments);
-    </script>
-</body>
-</html>
-    """
+@app.get("/documents/{document_id}", response_model=Document, summary="Взимане на документ по ID",
+         description="Връща детайли за конкретен документ по неговото уникално ID, ако принадлежи на текущия потребител.")
+async def get_document_by_id_endpoint(document_id: str, current_user_id: str = Depends(get_current_user_id)):
+    document = await document_service.get_document_from_firestore(document_id, current_user_id)
+    if not document:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Документът не е намерен или не принадлежи на текущия потребител.")
+    return document

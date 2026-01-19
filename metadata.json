@@ -1,0 +1,6 @@
+
+{
+  "name": "EntaGen",
+  "description": "EntaGen е висококачествен инструмент за анализ на корпоративни документи, използващ Gemini AI за многомодален анализ и съхранение във Firestore.",
+  "requestFramePermissions": []
+}
