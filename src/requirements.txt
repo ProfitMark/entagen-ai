@@ -1,0 +1,7 @@
+# requirements.txt
+fastapi[all]
+uvicorn
+google-cloud-firestore
+google-generativeai
+pypdf
+python-docx
