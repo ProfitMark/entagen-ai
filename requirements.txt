@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+python-multipart
+google-cloud-firestore
+google-generativeai
+PyPDF2
