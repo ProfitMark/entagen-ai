@@ -1,62 +1,133 @@
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
-from google.cloud import firestore
 import os
-import uvicorn
+from datetime import datetime
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
+from google.cloud import firestore
+import google.generativeai as genai
 
-app = FastAPI()
-db = firestore.Client()
+# --- Configuration & Security ---
+PROJECT_ID = "gen-lang-client-0119314757"
+# Now securely pulling from Cloud Run Environment Variables
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+
+if not GEMINI_API_KEY:
+    print("WARNING: GEMINI_API_KEY not found in environment variables.")
+
+# Initialize Gemini 1.5 Flash (Multimodal)
+genai.configure(api_key=GEMINI_API_KEY)
+model = genai.GenerativeModel('gemini-1.5-flash')
+
+# Initialize Firestore
+db = firestore.Client(project=PROJECT_ID)
+
+app = FastAPI(title="EntaGen Enterprise")
 
 @app.get("/", response_class=HTMLResponse)
-def root():
-    return """
+async def dashboard(request: Request):
+    """Dashboard: Displays documents and handles actions."""
+    docs = db.collection("documents").order_by("timestamp", direction=firestore.Query.DESCENDING).limit(15).stream()
+    
+    doc_rows = ""
+    for d in docs:
+        data = d.to_dict()
+        doc_id = d.id  # Firestore document ID
+        
+        doc_rows += f"""
+        <div class="card">
+            <div class="card-header">
+                <strong>{data.get('name')}</strong> 
+                <span class="badge">{data.get('status')}</span>
+                <small>{data.get('timestamp').strftime('%Y-%m-%d %H:%M')}</small>
+            </div>
+            <div class="card-body">
+                <p>{data.get('summary')}</p>
+                <form action="/delete/{doc_id}" method="post" style="margin:0;">
+                    <button type="submit" class="btn-delete">Delete</button>
+                </form>
+            </div>
+        </div>
+        """
+
+    return f"""
     <html>
         <head>
             <title>EntaGen Dashboard</title>
-            <meta charset="UTF-8">
+            <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/water.css@2/out/water.css">
+            <style>
+                .card {{ border: 1px solid #444; margin-bottom: 20px; padding: 15px; border-radius: 8px; position: relative; }}
+                .badge {{ background: #2ecc71; color: white; padding: 2px 8px; border-radius: 4px; font-size: 0.8em; }}
+                .upload-section {{ background: #222; padding: 20px; border-radius: 8px; margin-bottom: 30px; border: 1px dashed #555; }}
+                .btn-delete {{ 
+                    background-color: #ff4c4c; 
+                    color: white; 
+                    border: none; 
+                    padding: 5px 10px; 
+                    font-size: 0.8em; 
+                    cursor: pointer;
+                    border-radius: 4px;
+                }}
+                .btn-delete:hover {{ background-color: #cc0000; }}
+            </style>
         </head>
-        <body style="font-family: sans-serif; padding: 40px; background: #f4f7f6;">
-            <div style="max-width: 800px; margin: auto; background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1);">
-                <h1 style="color: #2c3e50;">EntaGen Documents</h1>
-                <hr>
-                <div id="data">Зареждане на документи...</div>
+        <body>
+            <h1>EntaGen AI Processor</h1>
+            
+            <div class="upload-section">
+                <h3>New Analysis</h3>
+                <form action="/upload" method="post" enctype="multipart/form-data">
+                    <input type="file" name="file" accept=".pdf,.txt" required>
+                    <button type="submit">Upload & Summarize (BG)</button>
+                </form>
             </div>
-            <script>
-                fetch('/documents')
-                    .then(res => res.json())
-                    .then(data => {
-                        const container = document.getElementById('data');
-                        if (data.length === 0) {
-                            container.innerHTML = "<p>Няма намерени документи.</p>";
-                            return;
-                        }
-                        container.innerHTML = data.map(d => `
-                            <div style="border-bottom: 1px solid #eee; padding: 15px 0;">
-                                <h3 style="margin: 0; color: #3498db;">${d.name || 'Няма име'}</h3>
-                                <p style="margin: 5px 0; color: #7f8c8d;">${d.summary || 'Няма резюме'}</p>
-                                <span style="font-size: 12px; background: #e1f5fe; padding: 2px 8px; border-radius: 10px;">Статус: ${d.status}</span>
-                            </div>
-                        `).join('');
-                    })
-                    .catch(err => {
-                        document.getElementById('data').innerHTML = "Грешка при зареждане на данните.";
-                    });
-            </script>
+
+            <h2>Document History</h2>
+            <div id="results">{doc_rows if doc_rows else "<p>No documents processed yet.</p>"}</div>
         </body>
     </html>
     """
 
-@app.get("/documents")
-def get_documents():
-    docs_ref = db.collection("documents")
-    docs = docs_ref.stream()
-    return [{"id": doc.id, **doc.to_dict()} for doc in docs]
+@app.post("/upload")
+async def handle_upload(file: UploadFile = File(...)):
+    """Processes upload using Gemini's native multimodal support."""
+    if not GEMINI_API_KEY:
+        raise HTTPException(status_code=500, detail="API Key not configured.")
 
-@app.get("/health")
-def health_check():
-    return {"status": "healthy"}
+    try:
+        content = await file.read()
+        
+        # Prepare document for Gemini (Direct Bytes)
+        doc_part = {
+            "mime_type": file.content_type,
+            "data": content
+        }
+        
+        prompt = "Моля, направи кратко резюме на този документ на български език, като подчертаеш най-важните точки."
+        
+        # Generation
+        response = model.generate_content([prompt, doc_part])
+        summary_text = response.text
 
-if __name__ == "__main__":
-    # Cloud Run изисква портът да се чете от променливата PORT
-    port = int(os.environ.get("PORT", 8080))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+        # Firestore Store
+        db.collection("documents").add({
+            "name": file.filename,
+            "summary": summary_text,
+            "status": "completed",
+            "timestamp": datetime.utcnow()
+        })
+
+        return RedirectResponse(url="/", status_code=303)
+
+    except Exception as e:
+        print(f"Error: {e}")
+        raise HTTPException(status_code=500, detail="Processing failed.")
+
+@app.post("/delete/{doc_id}")
+async def delete_document(doc_id: str):
+    """Deletes a document from Firestore."""
+    try:
+        db.collection("documents").document(doc_id).delete()
+        return RedirectResponse(url="/", status_code=303)
+    except Exception as e:
+        print(f"Delete Error: {e}")
+        raise HTTPException(status_code=500, detail="Delete failed.")
+        
